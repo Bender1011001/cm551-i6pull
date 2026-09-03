@@ -1,0 +1,12 @@
+bin/
+obj/
+*.user
+__pycache__/
+*.pyc
+
+# live dump / decode output — never commit
+dump.jsonl
+dump.json
+dumpB.json
+maps.html
+*.jsonl
