@@ -10,3 +10,7 @@ dump.json
 dumpB.json
 maps.html
 *.jsonl
+
+# build output - build from source with build.bat
+*.exe
+*.dll

@@ -1,0 +1,14 @@
+name: safety gates
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  safety-gates:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run the safety-gate harness (no hardware)
+        shell: pwsh
+        run: ./tests/run_safety_gates.ps1

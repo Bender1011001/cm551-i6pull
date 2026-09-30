@@ -1,6 +1,14 @@
 // I6Pull — read-only Cummins INLINE 6 / RP1210 puller for Dodge CM551 (ISB VP44).
 // Reads KennPar ITNs over 29-bit CAN (PGN EF00, command 0x48). Never programs,
 // erases, jumps to bootloader, or transmits VP44 11-bit fueling frames.
+//
+// Safety model (enforced in code, not just documented):
+//   * The only transmit path is SendCan(), which accepts an explicit allowlist of frames:
+//     J1939 transport control (RTS/CTS/EOM-ACK) and data on 0x18EC00F9 / 0x18EB00F9.
+//     No 11-bit frame is ever sent.
+//   * Every request to the ECM passes RequireReadRequest(): ReadByNTN (0x48) only, for an
+//     ITN that is not blocked, with a bounded length.
+//   * ITNs are taken only from the catalog CSV. --itn selects from it; it cannot add to it.
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -92,19 +100,48 @@ internal static class Rp
 
 internal static class Program
 {
-    // Never request these. They are passwords or boot-copy addresses.
+    // Never request these. They are passwords, calibration-download keys or boot-copy addresses.
+    // Keep in sync with BLOCKED_ITNS in vp44tune/i6host.py (a unit test compares them).
     static readonly HashSet<int> BlockedItn = new HashSet<int>
     {
         0x0005, 0x0016, 0x001E, 0x001F, 0x0020, 0x0021, 0x0022,
-        0x1083, 0x11AF, 0x1267
+        0x1000, 0x1083, 0x11AF, 0x1267
     };
 
-    // 11-bit ECM↔VP44 fueling IDs — listen only, never TX.
-    static readonly HashSet<int> BlockedCanId = new HashSet<int> { 0x112, 0x512, 0x001, 0x500 };
+    // Largest single ReadByNTN request; longer reads are split into chunks of this size.
+    const int MaxReadChunk = 1024;
+
+    // Transmit allowlist. Tool address 0xF9 to the ECM, J1939 transport protocol only:
+    // TP.CM (PGN EC00) with control byte RTS 0x10, CTS 0x11 or EOM-ACK 0x13, and TP.DT (PGN EB00).
+    // Everything else, including every 11-bit frame (the ECM<->VP44 fueling bus), is refused.
+    static bool TxAllowed(int canId, bool ext29, byte[] payload)
+    {
+        if (!ext29 || payload == null) return false;
+        if (canId == 0x18EB00F9) return payload.Length == 8;
+        if (canId == 0x18EC00F9)
+            return payload.Length == 8 && (payload[0] == 0x10 || payload[0] == 0x11 || payload[0] == 0x13);
+        return false;
+    }
+
+    // Choke point for requests to the ECM: ReadByNTN only, for a non-blocked ITN, bounded length.
+    static void RequireReadRequest(byte[] payload)
+    {
+        if (payload == null || payload.Length != 11 || payload[0] != 0x48)
+            throw new InvalidOperationException("refusing to transmit: not a ReadByNTN request");
+        int ntn = (payload[1] << 8) | payload[2];
+        int length = (payload[7] << 24) | (payload[8] << 16) | (payload[9] << 8) | payload[10];
+        if (IsBlocked(ntn))
+            throw new InvalidOperationException("refusing to transmit: ITN " + ntn.ToString("X4") + " is blocked");
+        if (length <= 0 || length > MaxReadChunk)
+            throw new InvalidOperationException("refusing to transmit: bad read length " + length);
+    }
 
     static bool Quiet = true;
     static string ReadsPath = "";
     static int Limit;
+    static readonly List<int> OnlyItns = new List<int>();
+    static int LenOverride;
+    static bool ProbeOnly;
 
     static int Main(string[] args)
     {
@@ -122,6 +159,20 @@ internal static class Program
             else if (a == "--proto" && i + 1 < args.Length) proto = args[++i];
             else if (a == "--reads" && i + 1 < args.Length) ReadsPath = args[++i];
             else if (a == "--limit" && i + 1 < args.Length) Limit = int.Parse(args[++i]);
+            else if (a == "--itn" && i + 1 < args.Length)
+            {
+                int v;
+                if (!int.TryParse(args[++i].Replace("0x", "").Replace("0X", ""),
+                        System.Globalization.NumberStyles.HexNumber, null, out v))
+                { Console.WriteLine("bad --itn value " + args[i]); return 2; }
+                OnlyItns.Add(v);
+            }
+            else if (a == "--len" && i + 1 < args.Length)
+            {
+                if (!int.TryParse(args[++i], out LenOverride) || LenOverride <= 0)
+                { Console.WriteLine("bad --len value " + args[i]); return 2; }
+            }
+            else if (a == "--probe") ProbeOnly = true;
             else if (a == "--verbose") Quiet = false;
             else
             {
@@ -157,9 +208,14 @@ internal static class Program
         Console.WriteLine("I6Pull — read-only INLINE 6 dump of a Dodge CM551");
         Console.WriteLine("  I6Pull.exe [--out dump.jsonl] [--reads catalog/chr0000_reads.csv]");
         Console.WriteLine("            [--proto CAN:Baud=250,Channel=1] [--limit N] [--verbose]");
+        Console.WriteLine("            [--probe] [--itn HEX] [--len N]");
         Console.WriteLine();
         Console.WriteLine("Close INSITE first (it holds the adapter). Key-on, engine stopped is fine.");
         Console.WriteLine("Requires Cummins INLINE 6 USB drivers (CMNSI632.dll, 32-bit).");
+        Console.WriteLine("--probe connects, prints hardware, disconnects. No catalog pull.");
+        Console.WriteLine("--itn HEX may be repeated. --len N overrides byte length for those ITNs.");
+        Console.WriteLine("AFFLLMZA (104F) is always requested at 588 bytes (21x14 cells).");
+        Console.WriteLine("Read-only. No 0x43/0x46. No 11-bit VP44 TX.");
     }
 
     static bool Session(StreamWriter w, string protocol)
@@ -179,6 +235,12 @@ internal static class Program
             Cmd(w, id, Rp.EchoTx, new byte[] { 1 }, "ECHO_TX on");
             Cmd(w, id, Rp.AllFiltersPass, null, "ALL_FILTERS_PASS");
             Drain(w, id, 80, protocol + "-idle");
+            if (ProbeOnly)
+            {
+                Log(w, "probe", "ok");
+                Console.WriteLine("PROBE OK");
+                return true;
+            }
             CatalogPull(w, id, ReadsPath);
             return true;
         }
@@ -219,8 +281,21 @@ internal static class Program
             int itn = Convert.ToInt32(p[0].Trim(), 16);
             int len = int.Parse(p[1].Trim());
             if (IsBlocked(itn) || len <= 0) continue;
+            if (OnlyItns.Count > 0 && !OnlyItns.Contains(itn)) continue;
+            // --len can only shorten a catalog read, never extend it.
+            if (LenOverride > 0 && OnlyItns.Contains(itn) && LenOverride < len) len = LenOverride;
+            if (itn == 0x104F && len < 588) len = 588; // AFFLLMZA 21x14 x u16
             rows.Add(new int[] { itn, len });
             names.Add(p.Length > 2 ? p[2].Trim() : "");
+        }
+        // --itn selects from the catalog; an ITN the catalog does not list is refused, never invented.
+        for (int k = 0; k < OnlyItns.Count; k++)
+        {
+            int want = OnlyItns[k];
+            bool have = false;
+            for (int r = 0; r < rows.Count; r++) if (rows[r][0] == want) { have = true; break; }
+            if (!have)
+                Console.WriteLine("ITN " + want.ToString("X4") + " is blocked or not in the catalog; not requested");
         }
         int n = rows.Count;
         if (Limit > 0 && Limit < n) n = Limit;
@@ -275,7 +350,7 @@ internal static class Program
 
     static byte[] CanReadNtn(StreamWriter w, short client, int ntn, int length)
     {
-        const int chunk = 1024;
+        const int chunk = MaxReadChunk;
         if (length <= chunk)
             return CanReadNtnOnce(w, client, ntn, 0, length);
         var parts = new List<byte[]>();
@@ -394,6 +469,7 @@ internal static class Program
 
     static bool CanSendTpEf00(StreamWriter w, short client, byte[] payload)
     {
+        RequireReadRequest(payload);
         int total = payload.Length;
         int pkts = (total + 6) / 7;
         byte[] rts = new byte[] {
@@ -459,8 +535,8 @@ internal static class Program
 
     static void SendCan(StreamWriter w, short id, int canId, bool ext29, byte[] payload, string tag)
     {
-        if (!ext29 && BlockedCanId.Contains(canId))
-            return;
+        if (!TxAllowed(canId, ext29, payload))
+            throw new InvalidOperationException("refusing to transmit frame 0x" + canId.ToString("X") + (ext29 ? " (29-bit)" : " (11-bit)"));
         var a = new byte[5 + payload.Length];
         a[0] = (byte)(ext29 ? 1 : 0);
         a[1] = (byte)((canId >> 24) & 0xFF);
